@@ -12,6 +12,9 @@ echo "==> 打包 .app …"
 rm -rf "build/$APP.app"
 mkdir -p "build/$APP.app/Contents/MacOS" "build/$APP.app/Contents/Resources"
 cp "$BIN" "build/$APP.app/Contents/MacOS/$APP"
+if [ -d Resources/AppIcon.iconset ]; then
+  iconutil -c icns Resources/AppIcon.iconset -o "build/$APP.app/Contents/Resources/AppIcon.icns"
+fi
 
 cat > "build/$APP.app/Contents/Info.plist" <<'EOF'
 <?xml version="1.0" encoding="UTF-8"?>
@@ -22,6 +25,7 @@ cat > "build/$APP.app/Contents/Info.plist" <<'EOF'
   <key>CFBundleDisplayName</key><string>任务管理器</string>
   <key>CFBundleIdentifier</key><string>com.local.mactaskmanager</string>
   <key>CFBundleExecutable</key><string>MacTaskManager</string>
+  <key>CFBundleIconFile</key><string>AppIcon</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>1.0</string>
   <key>CFBundleVersion</key><string>1</string>
