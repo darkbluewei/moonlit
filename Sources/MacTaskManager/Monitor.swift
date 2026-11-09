@@ -38,6 +38,7 @@ struct BatteryInfo {
     var tempC: Double?
     var watts: Double?      // 正数 = 充电，负数 = 放电
     var health: Double?
+    var adapterWatts: Double?
 }
 
 struct Snapshot {
@@ -59,6 +60,8 @@ struct Snapshot {
     var gpu: Double? = nil
     var battery: BatteryInfo? = nil
     var perProcNet = false
+    var cpuTemp: Double? = nil
+    var gpuTemp: Double? = nil
 }
 
 enum RefreshSpeed: String, CaseIterable, Identifiable {
@@ -186,6 +189,7 @@ final class Sampler: @unchecked Sendable {
     private var prevWall: UInt64 = 0
     private var prevProc: [Int32: (UInt64, UInt64, UInt64)] = [:]
     private let netTop = NetTop()
+    private let smc = SMCReader()
     private var users: [UInt32: String] = [:]
     private var tb = mach_timebase_info_data_t()
 
@@ -235,6 +239,9 @@ final class Sampler: @unchecked Sendable {
         s.gpu = readGPU()
         s.battery = readBattery()
         s.perProcNet = netTop.hasData
+        let temps = smc.temperatures()
+        s.cpuTemp = temps.cpu
+        s.gpuTemp = temps.gpu
         s.procs = readProcs(wall: wall, cores: max(cores.count, 1))
         prevWall = wall
         return s
@@ -382,7 +389,7 @@ final class Sampler: @unchecked Sendable {
         let cur = num("CurrentCapacity") ?? 0
         let maxCap = num("MaxCapacity") ?? 100
         let design = num("DesignCapacity") ?? 0
-        let rawMax = num("AppleRawMaxCapacity") ?? maxCap
+        let rawMax = num("AppleRawMaxCapacity") ?? num("NominalChargeCapacity") ?? maxCap
         var watts: Double?
         if let v = num("Voltage"), let n = (d["InstantAmperage"] ?? d["Amperage"]) as? NSNumber {
             let amps = Double(Int64(bitPattern: n.uint64Value))
@@ -395,7 +402,8 @@ final class Sampler: @unchecked Sendable {
             cycles: Int(num("CycleCount") ?? 0),
             tempC: num("Temperature").map { $0 / 100 },
             watts: watts,
-            health: design > 100 ? min(rawMax / design, 1.2) : nil)
+            health: (design > 100 && rawMax > 100) ? min(rawMax / design, 1.2) : nil,
+            adapterWatts: ((d["AdapterDetails"] as? [String: Any])?["Watts"] as? NSNumber)?.doubleValue)
     }
 
     // 进程
@@ -600,5 +608,109 @@ final class NetTop: @unchecked Sendable {
         latestAt = now
         current = [:]
         gotData = true
+    }
+}
+
+// MARK: - SMC 温度（尽力而为）
+// Intel 与 Apple 芯片的传感器键名不同，所以这里自动枚举所有以 T 开头的键，
+// 把 Tp / Te / TC 归为 CPU，Tg / TG 归为 GPU，只保留 5～125 ℃ 的合理读数，取最高值。
+
+private struct SMCVers { var major: UInt8 = 0; var minor: UInt8 = 0; var build: UInt8 = 0; var reserved: UInt8 = 0; var release: UInt16 = 0 }
+private struct SMCPLimit { var version: UInt16 = 0; var length: UInt16 = 0; var cpuPLimit: UInt32 = 0; var gpuPLimit: UInt32 = 0; var memPLimit: UInt32 = 0 }
+private struct SMCKeyInfo { var dataSize: UInt32 = 0; var dataType: UInt32 = 0; var dataAttributes: UInt8 = 0; var pad1: UInt8 = 0; var pad2: UInt8 = 0; var pad3: UInt8 = 0 }
+private struct SMCKeyData {
+    var key: UInt32 = 0
+    var vers = SMCVers()
+    var pLimit = SMCPLimit()
+    var keyInfo = SMCKeyInfo()
+    var result: UInt8 = 0
+    var status: UInt8 = 0
+    var data8: UInt8 = 0
+    var data32: UInt32 = 0
+    var bytes: (UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8,
+                UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8)
+        = (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+}
+
+private func fourCC(_ s: String) -> UInt32 { s.utf8.reduce(0) { ($0 << 8) | UInt32($1) } }
+
+private func fourCCString(_ v: UInt32) -> String {
+    let b: [UInt8] = [UInt8(v >> 24), UInt8((v >> 16) & 0xFF), UInt8((v >> 8) & 0xFF), UInt8(v & 0xFF)]
+    return String(bytes: b, encoding: .ascii) ?? ""
+}
+
+final class SMCReader {
+    private var conn: io_connect_t = 0
+    private var attempted = false
+    private var keys: [(key: UInt32, size: UInt32, isGPU: Bool)] = []
+
+    private func call(_ input: inout SMCKeyData, _ output: inout SMCKeyData) -> Bool {
+        var outSize = MemoryLayout<SMCKeyData>.stride
+        let kr = IOConnectCallStructMethod(conn, 2, &input, MemoryLayout<SMCKeyData>.stride, &output, &outSize)
+        return kr == KERN_SUCCESS && output.result == 0
+    }
+
+    private func keyInfo(_ key: UInt32) -> SMCKeyInfo? {
+        var i = SMCKeyData()
+        var o = SMCKeyData()
+        i.key = key
+        i.data8 = 9      // 读取键信息
+        return call(&i, &o) ? o.keyInfo : nil
+    }
+
+    private func readBytes(_ key: UInt32, size: UInt32) -> [UInt8]? {
+        var i = SMCKeyData()
+        var o = SMCKeyData()
+        i.key = key
+        i.keyInfo.dataSize = size
+        i.data8 = 5      // 读取键值
+        guard call(&i, &o) else { return nil }
+        return withUnsafeBytes(of: &o.bytes) { Array($0.prefix(Int(min(size, 32)))) }
+    }
+
+    private func setup() {
+        attempted = true
+        guard MemoryLayout<SMCKeyData>.stride == 80 else { return }     // 结构体布局必须与内核一致
+        let svc = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("AppleSMC"))
+        guard svc != 0 else { return }
+        defer { IOObjectRelease(svc) }
+        guard IOServiceOpen(svc, mach_task_self_, 0, &conn) == KERN_SUCCESS else { conn = 0; return }
+        let countKey = fourCC("#KEY")
+        guard let ci = keyInfo(countKey), let b = readBytes(countKey, size: ci.dataSize), b.count >= 4 else { return }
+        let count = (UInt32(b[0]) << 24) | (UInt32(b[1]) << 16) | (UInt32(b[2]) << 8) | UInt32(b[3])
+        for idx in 0..<min(count, 3000) {
+            var i = SMCKeyData()
+            var o = SMCKeyData()
+            i.data8 = 8      // 按序号取键名
+            i.data32 = idx
+            guard call(&i, &o) else { continue }
+            let name = fourCCString(o.key)
+            guard name.hasPrefix("T"), let info = keyInfo(o.key) else { continue }
+            let t = fourCCString(info.dataType)
+            guard (t == "flt " && info.dataSize == 4) || (t == "sp78" && info.dataSize == 2) else { continue }
+            let gpu = name.hasPrefix("Tg") || name.hasPrefix("TG")
+            let cpu = name.hasPrefix("Tp") || name.hasPrefix("Te") || name.hasPrefix("TC")
+            if cpu || gpu { keys.append((key: o.key, size: info.dataSize, isGPU: gpu)) }
+        }
+    }
+
+    func temperatures() -> (cpu: Double?, gpu: Double?) {
+        if !attempted { setup() }
+        guard conn != 0, !keys.isEmpty else { return (nil, nil) }
+        var cpu: Double?
+        var gpu: Double?
+        for k in keys {
+            guard let b = readBytes(k.key, size: k.size), b.count >= Int(k.size) else { continue }
+            let v: Double
+            if k.size == 4 {
+                let raw = UInt32(b[0]) | (UInt32(b[1]) << 8) | (UInt32(b[2]) << 16) | (UInt32(b[3]) << 24)
+                v = Double(Float(bitPattern: raw))
+            } else {
+                v = Double(Int16(bitPattern: (UInt16(b[0]) << 8) | UInt16(b[1]))) / 256
+            }
+            guard v > 5, v < 125 else { continue }
+            if k.isGPU { gpu = max(gpu ?? v, v) } else { cpu = max(cpu ?? v, v) }
+        }
+        return (cpu, gpu)
     }
 }

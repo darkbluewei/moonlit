@@ -14,6 +14,8 @@ func fmtBytes(_ b: UInt64) -> String { formatBytes(Int64(b), .memory) }
 
 func fmtRate(_ b: Double) -> String { formatBytes(Int64(max(b, 0)), .file) + "/s" }
 
+func fmtTemp(_ t: Double?) -> String { t.map { String(format: "%.0f ℃", $0) } ?? "—" }
+
 func pct0(_ v: Double) -> String { String(format: "%.0f%%", v * 100) }
 func pct1(_ v: Double) -> String { String(format: "%.1f%%", v * 100) }
 

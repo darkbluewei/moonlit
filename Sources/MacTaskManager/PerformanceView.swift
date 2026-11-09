@@ -116,7 +116,7 @@ struct PerformanceView: View {
         let s = monitor.snap
         switch r {
         case .cpu:
-            return [("利用率", pct1(s.cpuTotal)), ("进程", "\(s.procs.count)"),
+            return [("利用率", pct1(s.cpuTotal)), ("温度", fmtTemp(s.cpuTemp)), ("进程", "\(s.procs.count)"),
                     ("线程", "\(s.procs.reduce(0) { $0 + $1.threads })"),
                     ("逻辑核心", "\(s.cores.count)"), ("已运行", fmtUptime(ProcessInfo.processInfo.systemUptime))]
         case .memory:
@@ -129,7 +129,7 @@ struct PerformanceView: View {
         case .network:
             return [("接收 ↓", fmtRate(s.netIn)), ("发送 ↑", fmtRate(s.netOut))]
         case .gpu:
-            return [("利用率", pct1(s.gpu ?? 0))]
+            return [("利用率", pct1(s.gpu ?? 0)), ("温度", fmtTemp(s.gpuTemp))]
         case .battery:
             return batteryStats(s.battery)
         }
@@ -149,10 +149,14 @@ struct PerformanceView: View {
     private func batteryStats(_ b: BatteryInfo?) -> [(String, String)] {
         guard let b else { return [] }
         var out: [(String, String)] = [("电量", pct1(b.percent)), ("状态", batteryState(b))]
-        if let h = b.health { out.append(("电池健康", pct0(h))) }
+        out.append(("电池健康", b.health.map { pct0($0) } ?? "—"))
         out.append(("循环次数", "\(b.cycles)"))
         if let t = b.tempC { out.append(("电池温度", String(format: "%.1f ℃", t))) }
-        if let w = b.watts { out.append((w >= 0 ? "充电功率" : "放电功率", String(format: "%.1f W", abs(w)))) }
+        if let w = b.watts {
+            let label = b.isCharging ? "充电功率" : (b.pluggedIn ? "电池功率" : "放电功率")
+            out.append((label, String(format: "%.1f W", abs(w))))
+        }
+        if let a = b.adapterWatts, b.pluggedIn { out.append(("电源适配器", String(format: "%.0f W", a))) }
         return out
     }
 
@@ -206,6 +210,9 @@ struct PerformanceView: View {
         switch r {
         case .cpu: return Array(all.dropFirst().prefix(3))
         case .memory: return all.filter { ["总量", "App 内存", "已压缩"].contains($0.0) }
+        case .battery:
+            let order = ["电池健康", "充电功率", "放电功率", "电池功率", "电池温度"]
+            return Array(order.compactMap { t in all.first { $0.0 == t } }.prefix(3))
         default: return Array(all.prefix(3))
         }
     }
