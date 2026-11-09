@@ -92,6 +92,9 @@ final class Monitor: ObservableObject {
     @Published var batteryHist: [Double] = []
     @Published var speed: RefreshSpeed = .normal
 
+    static let shared = Monitor()
+    var active = true      // 窗口不可见（关闭 / 最小化 / 被遮挡 / 隐藏）时为 false，停止采集
+
     let cpuName: String = Monitor.brand()
     private let sampler = Sampler()
     private var started = false
@@ -111,14 +114,22 @@ final class Monitor: ObservableObject {
         started = true
         let sampler = self.sampler
         Task.detached(priority: .utility) { [weak self] in
+            var idle = false
+            var warm = true
             while true {
                 guard let self else { return }
                 let sp = self.speed
-                if sp != .paused {
-                    let s = sampler.sample()
-                    await MainActor.run { self.apply(s) }
+                if sp == .paused || !self.active {      // 手动暂停 / 窗口不可见：不采集
+                    if !idle { idle = true; sampler.setSuspended(true) }
+                    try? await Task.sleep(nanoseconds: 300_000_000)
+                    continue
                 }
-                try? await Task.sleep(nanoseconds: UInt64(sp.seconds * 1_000_000_000))
+                if idle { idle = false; warm = true; sampler.setSuspended(false) }
+                let s = sampler.sample()
+                await MainActor.run { self.apply(s) }
+                let wait = warm ? 0.4 : sp.seconds       // 恢复后很快再采一次，避免数值先显示为 0
+                warm = false
+                try? await Task.sleep(nanoseconds: UInt64(wait * 1_000_000_000))
             }
         }
     }
@@ -181,6 +192,20 @@ final class Sampler: @unchecked Sendable {
     init() {
         mach_timebase_info(&tb)
         netTop.start()
+    }
+
+    /// 暂停 / 恢复：暂停时挂起 nettop；恢复时清空所有“上一次”的基线，避免把暂停期间的累计量算成瞬时速率
+    func setSuspended(_ suspended: Bool) {
+        if suspended {
+            netTop.suspend()
+        } else {
+            prevCPU = []
+            prevNet = nil
+            prevDisk = nil
+            prevWall = 0
+            prevProc = [:]
+            netTop.resume()
+        }
     }
 
     func sample() -> Snapshot {
@@ -485,6 +510,7 @@ final class NetTop: @unchecked Sendable {
     private var colIn = -1
     private var colOut = -1
     private var gotData = false
+    private var ignoreUntil = Date.distantPast
 
     var hasData: Bool {
         lock.lock()
@@ -496,6 +522,19 @@ final class NetTop: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         return rateMap
+    }
+
+    func suspend() { process?.suspend() }
+
+    func resume() {
+        lock.lock()
+        latest = [:]
+        current = [:]
+        currentStamp = ""
+        buffer.removeAll()
+        ignoreUntil = Date().addingTimeInterval(1.5)   // 丢弃恢复瞬间涌出的旧数据
+        lock.unlock()
+        process?.resume()
     }
 
     func start() {
@@ -521,6 +560,7 @@ final class NetTop: @unchecked Sendable {
     private func consume(_ data: Data) {
         lock.lock()
         defer { lock.unlock() }
+        if Date() < ignoreUntil { buffer.removeAll(); return }
         buffer.append(data)
         while let nl = buffer.firstIndex(of: 0x0A) {
             let lineData = buffer.subdata(in: buffer.startIndex..<nl)
@@ -553,7 +593,7 @@ final class NetTop: @unchecked Sendable {
         let dt = now.timeIntervalSince(latestAt)
         var map: [Int32: Double] = [:]
         for (pid, v) in current {
-            if let old = latest[pid], dt > 0 { map[pid] = Double(v >= old ? v - old : v) / dt }
+            if let old = latest[pid], dt >= 0.5 { map[pid] = Double(v >= old ? v - old : v) / dt }
         }
         rateMap = map
         latest = current

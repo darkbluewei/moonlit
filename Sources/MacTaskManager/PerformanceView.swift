@@ -31,6 +31,9 @@ struct PerformanceView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             PageHeader(title: "性能", subtitle: "最近 60 秒的实时使用情况")
+            if theme.id == .dashboard {
+                dashboard
+            } else {
             HStack(alignment: .top, spacing: 18) {
                 ScrollView {
                     VStack(spacing: 10) {
@@ -41,6 +44,7 @@ struct PerformanceView: View {
                 .frame(width: 256)
                 ScrollView { detail }
                     .frame(maxWidth: .infinity)
+            }
             }
         }
         .padding(.horizontal, 22)
@@ -150,6 +154,120 @@ struct PerformanceView: View {
         if let t = b.tempC { out.append(("电池温度", String(format: "%.1f ℃", t))) }
         if let w = b.watts { out.append((w >= 0 ? "充电功率" : "放电功率", String(format: "%.1f W", abs(w)))) }
         return out
+    }
+
+    // MARK: 监控大屏（仪表盘风格）
+
+    private var dashboard: some View {
+        GeometryReader { geo in
+            let items = resources
+            let total = items.count + (items.count == 5 ? 1 : 0)
+            let cols = total <= 4 ? 2 : 3
+            let rows = (total + cols - 1) / cols
+            let gap: CGFloat = 14
+            let cardH = max(210, (geo.size.height - gap * CGFloat(rows - 1)) / CGFloat(rows))
+            ScrollView {
+                LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: gap), count: cols), spacing: gap) {
+                    ForEach(items) { r in bigCard(r).frame(height: cardH) }
+                    if items.count == 5 { sysCard.frame(height: cardH) }
+                }
+            }
+        }
+        .frame(maxHeight: .infinity)
+    }
+
+    private func ringValue(_ r: Res) -> Double {
+        let s = monitor.snap
+        switch r {
+        case .cpu: return s.cpuTotal
+        case .memory: return s.memTotal > 0 ? Double(s.memUsed) / Double(s.memTotal) : 0
+        case .disk:
+            let scale = max(1_000_000, (monitor.diskReadHist.max() ?? 0) + (monitor.diskWriteHist.max() ?? 0))
+            return min(1, (s.diskRead + s.diskWrite) / scale)
+        case .network:
+            let scale = max(1_000_000, (monitor.netInHist.max() ?? 0) + (monitor.netOutHist.max() ?? 0))
+            return min(1, (s.netIn + s.netOut) / scale)
+        case .gpu: return s.gpu ?? 0
+        case .battery: return s.battery?.percent ?? 0
+        }
+    }
+
+    private func ringLabel(_ r: Res) -> String {
+        let s = monitor.snap
+        switch r {
+        case .disk: return fmtRate(s.diskRead + s.diskWrite)
+        case .network: return fmtRate(s.netIn + s.netOut)
+        default: return pct0(ringValue(r))
+        }
+    }
+
+    private func cardStats(_ r: Res) -> [(String, String)] {
+        let all = stats(r)
+        switch r {
+        case .cpu: return Array(all.dropFirst().prefix(3))
+        case .memory: return all.filter { ["总量", "App 内存", "已压缩"].contains($0.0) }
+        default: return Array(all.prefix(3))
+        }
+    }
+
+    private func bigCard(_ r: Res) -> some View {
+        let g = graphData(r)
+        let c = color(r)
+        let shape = RoundedRectangle(cornerRadius: theme.radius, style: .continuous)
+        return VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 8) {
+                Circle().fill(c).frame(width: 8, height: 8).shadow(color: c, radius: 4)
+                Text(r.rawValue).font(.system(size: 15, weight: .semibold, design: .rounded))
+                Spacer()
+                Text(subtitle(r)).font(.system(size: 11)).foregroundStyle(theme.secondary).lineLimit(1)
+            }
+            HStack(spacing: 14) {
+                RingGauge(value: ringValue(r), color: c, label: ringLabel(r))
+                    .frame(width: 98, height: 98)
+                VStack(spacing: 6) {
+                    ForEach(Array(cardStats(r).enumerated()), id: \.offset) { item in
+                        HStack {
+                            Text(item.element.0).foregroundStyle(theme.secondary)
+                            Spacer(minLength: 6)
+                            Text(item.element.1).monospacedDigit().lineLimit(1)
+                        }
+                        .font(.system(size: 12))
+                    }
+                }
+            }
+            LineGraph(series: g.series, colors: colors(r))
+                .frame(maxHeight: .infinity)
+                .background(Color.black.opacity(0.22))
+                .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+        }
+        .padding(14)
+        .background(shape.fill(theme.surface))
+        .overlay(shape.strokeBorder(LinearGradient(colors: [c.opacity(0.55), theme.stroke],
+                                                    startPoint: .topLeading, endPoint: .bottomTrailing), lineWidth: 1))
+        .shadow(color: c.opacity(0.12), radius: 14)
+    }
+
+    private var sysCard: some View {
+        let s = monitor.snap
+        return VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 8) {
+                Circle().fill(theme.accent).frame(width: 8, height: 8).shadow(color: theme.accent, radius: 4)
+                Text("系统").font(.system(size: 15, weight: .semibold, design: .rounded))
+                Spacer()
+            }
+            Text(monitor.cpuName).font(.system(size: 13, weight: .medium)).lineLimit(2)
+            Text("macOS · \(ProcessInfo.processInfo.operatingSystemVersionString)")
+                .font(.system(size: 11)).foregroundStyle(theme.secondary).lineLimit(2)
+            Spacer(minLength: 0)
+            LazyVGrid(columns: [GridItem(.flexible(), spacing: 10), GridItem(.flexible(), spacing: 10)], spacing: 10) {
+                StatTile(title: "进程", value: "\(s.procs.count)")
+                StatTile(title: "线程", value: "\(s.procs.reduce(0) { $0 + $1.threads })")
+                StatTile(title: "逻辑核心", value: "\(s.cores.count)")
+                StatTile(title: "已运行", value: fmtUptime(ProcessInfo.processInfo.systemUptime))
+            }
+        }
+        .padding(14)
+        .card()
     }
 
     // MARK: 左侧卡片

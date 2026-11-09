@@ -113,6 +113,34 @@ struct StatTile: View {
     }
 }
 
+// MARK: - 圆环仪表
+
+struct RingGauge: View {
+    @Environment(\.theme) private var theme
+    var value: Double       // 0...1
+    var color: Color
+    var label: String
+
+    var body: some View {
+        ZStack {
+            Circle().stroke(theme.surfaceStrong, lineWidth: 10)
+            Circle()
+                .trim(from: 0, to: CGFloat(min(max(value, 0.004), 1)))
+                .stroke(AngularGradient(colors: [color.opacity(0.4), color], center: .center,
+                                        startAngle: .degrees(0), endAngle: .degrees(360)),
+                        style: StrokeStyle(lineWidth: 10, lineCap: .round))
+                .rotationEffect(.degrees(-90))
+                .shadow(color: theme.glow ? color.opacity(0.7) : .clear, radius: 6)
+                .animation(.easeOut(duration: 0.5), value: value)
+            Text(label)
+                .font(.system(size: 17, weight: .semibold, design: .rounded).monospacedDigit())
+                .minimumScaleFactor(0.5)
+                .lineLimit(1)
+                .padding(.horizontal, 16)
+        }
+    }
+}
+
 // MARK: - 折线图
 
 struct GridLines: Shape {

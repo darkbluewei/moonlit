@@ -18,7 +18,8 @@ enum Tab: String, CaseIterable, Identifiable {
 
 @main
 struct MacTaskManagerApp: App {
-    @StateObject private var monitor = Monitor()
+    @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
+    @StateObject private var monitor = Monitor.shared
     @AppStorage("theme") private var themeRaw: String = ThemeID.glass.rawValue
 
     private var theme: Theme { themeRaw == ThemeID.dashboard.rawValue ? .dashboard : .glass }
@@ -91,6 +92,11 @@ struct Sidebar: View {
             miniStats
             refreshMenu
             themeSwitch
+            Text("⌃⌥/  随时呼出窗口")
+                .font(.system(size: 10.5))
+                .foregroundStyle(theme.secondary)
+                .frame(maxWidth: .infinity)
+                .padding(.top, 8)
         }
         .padding(12)
     }
